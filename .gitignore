@@ -1,0 +1,56 @@
+# ---- Node ----
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ---- Env / secrets ----
+.env
+.env.*
+!.env.example
+.env_router
+.env_router.*
+
+# ---- MCP machine-local config ----
+mcp.json
+mcp_env_debug.txt
+
+# ---- Databases / archives ----
+*.db
+*.sqlite
+*.sqlite3
+database/
+databases/
+archive/
+archives/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+ENV/
+.envrc
+
+# ---- Audio / media outputs ----
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.m4a
+
+# ---- OS junk ----
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# ---- Editors ----
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ---- Build / dist ----
+dist/
+build/

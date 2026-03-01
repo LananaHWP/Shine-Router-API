@@ -1,0 +1,18 @@
+{
+  "name": "shine-router-api",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "description": "Two-model router API: Model A (tools+MCP memory) -> Model B (Shine response) -> Model A (memory write).",
+  "main": "router_api.mjs",
+  "scripts": {
+    "start": "node router_api.mjs",
+    "dev": "node router_api.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "dotenv": "^17.3.1",
+    "express": "^4.19.2",
+    "openai": "^4.0.0"
+  }
+}
