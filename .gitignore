@@ -54,3 +54,4 @@ Desktop.ini
 # ---- Build / dist ----
 dist/
 build/
+.aider*

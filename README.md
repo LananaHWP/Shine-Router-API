@@ -90,7 +90,7 @@ Model A decides:
 - Two models loaded in LM Studio:
   - **Model A** (router / small tool model)
   - **Model B** (Shine / larger expressive model)
-- Your fork of Persistent AI Memory:  
+  - My fork of Persistent AI Memory:  
   **https://github.com/LananaHWP/persistent-ai-memory-shine**
 
 ## Installing Persistent AI Memory (Required)
@@ -131,7 +131,6 @@ PORT=8787
 MCP_JSON_PATH=E:\Shine Voice\router_api\mcp.json
 ```
 
-> **Important:** `.env_router` is private. Do **NOT** commit it.
 
 ### 3) Configure MCP
 
@@ -145,7 +144,7 @@ MCP_JSON_PATH=E:\Shine Voice\router_api\mcp.json
 The router launches:
 
 - `mcp_wrapper.py`
-- which starts your Persistent AI Memory fork via stdio.
+- which starts the Persistent AI Memory fork via stdio.
 
 ### 4) Start Router
 
@@ -179,23 +178,6 @@ Server runs at:
   "memories_used": 1
 }
 ```
-## Identity Behavior
-
-Shine is:
-
-- **Witty**
-- **Playful**
-- **Emotionally steady**
-- **Opinionated**
-- **Not self-introducing unless asked**
-
-**If asked:**
-
-> "Who are you?"
-
-She gives a short friendly self-introduction.
-
-**Otherwise:** No unnecessary introductions.
 
 ## Memory Guarantees
 
@@ -243,28 +225,7 @@ Always quote Windows paths in shell commands.
 ```bash
 cd "E:\Shine Voice\router_api"
 ```
-## Security & Git Hygiene
 
-**Never commit:**
-
-- `.env_router`
-- `.env`
-- `node_modules/`
-- `*.db`
-- SQLite databases
-- audio outputs
-- logs
-- model caches
-- machine-specific `mcp.json`
-
-**If you accidentally committed secrets:**
-
-```bash
-git rm --cached .env_router
-git commit -m "Remove secrets"
-```
-
-Then rotate any exposed tokens.
 
 ## Design Philosophy
 
