@@ -106,7 +106,7 @@ function pickImageInput(reqBody) {
 function buildUserContent(text, image, imageUrl) {
   const t = String(text ?? "").trim();
   if (!image && !imageUrl) return t;
-  const url = imageUrl || image;
+  const url = image || imageUrl;
   return [
     { type: "text", text: t || "Describe this image." },
     { type: "image_url", image_url: { url } },
@@ -116,6 +116,32 @@ function buildUserContent(text, image, imageUrl) {
 function safeTextForMemoryOps(text, hasImage) {
   const t = String(text ?? "").trim();
   return hasImage ? (t ? `${t} [image attached]` : "[image attached]") : t;
+}
+
+async function resolveImageDataUrl(image, imageUrl) {
+  if (typeof image === "string" && image.startsWith("data:image/")) {
+    return { dataUrl: image, originalUrl: null };
+  }
+  if (typeof imageUrl === "string" && imageUrl.startsWith("data:image/")) {
+    return { dataUrl: imageUrl, originalUrl: null };
+  }
+  if (typeof imageUrl === "string" && /^https?:\/\//i.test(imageUrl)) {
+    const resp = await fetch(imageUrl);
+    if (!resp.ok) throw new Error(`Failed to fetch imageUrl: ${resp.status} ${resp.statusText}`);
+
+    const len = Number(resp.headers.get("content-length") || "0");
+    const maxBytes = Number(process.env.MAX_IMAGE_BYTES || String(8 * 1024 * 1024));
+    if (len && len > maxBytes) throw new Error(`Image too large (${len} bytes > ${maxBytes}).`);
+
+    const ct = resp.headers.get("content-type") || "image/png";
+    const ab = await resp.arrayBuffer();
+    const buf = Buffer.from(ab);
+    if (buf.length > maxBytes) throw new Error(`Image too large (${buf.length} bytes > ${maxBytes}).`);
+
+    const b64 = buf.toString("base64");
+    return { dataUrl: `data:${ct};base64,${b64}`, originalUrl: imageUrl };
+  }
+  return { dataUrl: null, originalUrl: null };
 }
 
 
@@ -295,7 +321,7 @@ function sanitizeMemoryQuery(q) {
 // --------------------
 // Model A: decide search (pre)
 // --------------------
-async function modelA_decideSearch(userText, image, imageUrl) {
+async function modelA_decideSearch(userText, imageDataUrl, originalImageUrl) {
   const sys = {
     role: "system",
     content: [
@@ -317,7 +343,7 @@ async function modelA_decideSearch(userText, image, imageUrl) {
 
   const r = await openai.chat.completions.create({
     model: MODEL_A,
-    messages: [sys, { role: "user", content: buildUserContent(userText, image, imageUrl) }],
+    messages: [sys, { role: "user", content: buildUserContent(userText, imageDataUrl, originalImageUrl) }],
     temperature: 0.2,
   });
 
@@ -332,7 +358,7 @@ async function modelA_decideSearch(userText, image, imageUrl) {
 // --------------------
 // Model A: filter memory bullets for relevance (pre)
 // --------------------
-async function modelA_filterMemory(userText, memoryBullets, image, imageUrl) {
+async function modelA_filterMemory(userText, memoryBullets, imageDataUrl, originalImageUrl) {
   if (!memoryBullets.length) return [];
 
   const sys = {
@@ -352,7 +378,7 @@ ${userText}
 MEMORY BULLETS:
 ${memoryBullets.map(b => "- " + b).join(NL)}`;
 
-  const mem = { role: "user", content: buildUserContent(bulletsText, image, imageUrl) };
+  const mem = { role: "user", content: buildUserContent(bulletsText, imageDataUrl, originalImageUrl) };
 
   const r = await openai.chat.completions.create({
     model: MODEL_A,
@@ -368,7 +394,7 @@ ${memoryBullets.map(b => "- " + b).join(NL)}`;
 // --------------------
 // Model B: Shine answer (no tools)
 // --------------------
-async function modelB_answer(userText, memoryBullets, conversation, mode, image, imageUrl) {
+async function modelB_answer(userText, memoryBullets, conversation, mode, imageDataUrl, originalImageUrl) {
   const memoryContext = memoryBullets.length
     ? memoryBullets.slice(0, 8).map((b) => `- ${b}`).join(NL)
     : "";
@@ -381,7 +407,7 @@ async function modelB_answer(userText, memoryBullets, conversation, mode, image,
 
   const r = await openai.chat.completions.create({
     model: MODEL_B,
-    messages: [sys1, sys2, ...conversation, { role: "user", content: buildUserContent(userText, image, imageUrl) }],
+    messages: [sys1, sys2, ...conversation, { role: "user", content: buildUserContent(userText, imageDataUrl, originalImageUrl) }],
     temperature: 0.7,
   });
 
@@ -391,7 +417,7 @@ async function modelB_answer(userText, memoryBullets, conversation, mode, image,
 // --------------------
 // Model A: decide write (post) after seeing Shine reply
 // --------------------
-async function modelA_decideWrite(userText, shineReply, memoryBullets, image, imageUrl) {
+async function modelA_decideWrite(userText, shineReply, memoryBullets, imageDataUrl, originalImageUrl) {
   const sys = {
     role: "system",
     content: [
@@ -420,16 +446,12 @@ async function modelA_decideWrite(userText, shineReply, memoryBullets, image, im
     content: ["EXISTING RELEVANT MEMORIES:", ...memoryBullets.map((b) => `- ${b}`)].join(NL),
   };
 
-  const ctxText = `USER SAID:
-${safeTextForMemoryOps(userText, !!(image || imageUrl))}
+const ctxText =
+  `USER SAID:${NL}${safeTextForMemoryOps(userText, !!(imageDataUrl || originalImageUrl))}` +
+  `${NL}${NL}SHINE REPLIED:${NL}${shineReply}` +
+  (originalImageUrl ? `${NL}${NL}IMAGE URL:${NL}${originalImageUrl}` : "");
 
-SHINE REPLIED:
-${shineReply}` + (imageUrl ? `
-
-IMAGE URL:
-${imageUrl}` : "");
-
-  const ctx = { role: "user", content: buildUserContent(ctxText, image, imageUrl) };
+  const ctx = { role: "user", content: buildUserContent(ctxText, imageDataUrl, originalImageUrl) };
 
   const r = await openai.chat.completions.create({
     model: MODEL_A,
@@ -474,7 +496,10 @@ app.post("/generate", async (req, res) => {
     const userText = stripEmojis(String(req.body.text ?? ""));
 
     const { imageUrl, image } = pickImageInput(req.body);
-    const hasImage = !!(imageUrl || image);
+    const resolved = await resolveImageDataUrl(image, imageUrl);
+    const imageDataUrl = resolved.dataUrl;
+    const originalImageUrl = resolved.originalUrl || (typeof imageUrl === "string" ? imageUrl : null);
+    const hasImage = !!imageDataUrl;
 
     if (!userText.trim() && !hasImage) return res.status(400).json({ ok: false, error: "Missing text (or provide image/imageUrl)" });
 
@@ -493,7 +518,7 @@ try {
 
 // 2) Optional refinement pass (best-effort; never cancels baseline results)
 try {
-  const s = await modelA_decideSearch(userText, image, imageUrl);
+  const s = await modelA_decideSearch(userText, imageDataUrl, originalImageUrl);
   if (s.shouldSearch && s.query) {
     const refined = await search_memories(sanitizeMemoryQuery(s.query) || safeTextForMemoryOps(userText, hasImage), 12);
     const seen = new Set(memoryBullets);
@@ -505,7 +530,7 @@ try {
 
 // 3) Pattern B: filter for relevance (best-effort; keep unfiltered on failure)
 try {
-  const filtered = await modelA_filterMemory(userText, memoryBullets, image, imageUrl);
+  const filtered = await modelA_filterMemory(userText, memoryBullets, imageDataUrl, originalImageUrl);
   // Don’t let an over-strict filter erase useful retrieved memories
   if (Array.isArray(filtered) && filtered.length) memoryBullets = filtered;
   console.log("[Router] filtered memory bullets:", memoryBullets);
@@ -514,22 +539,36 @@ try {
 }
 
 // Phase 2: Shine answers
-    const shineReply = await modelB_answer(userText, memoryBullets, conversation, mode, image, imageUrl);
+    const shineReply = await modelB_answer(userText, memoryBullets, conversation, mode, imageDataUrl, originalImageUrl);
 
-    // Phase 3: decide write -> MCP create_memory
-const mem = await modelA_decideWrite(userText, shineReply, memoryBullets, image, imageUrl);
+// Phase 3: decide write -> MCP create_memory (NON-FATAL)
+try {
+  const mem = await modelA_decideWrite(
+    userText,
+    shineReply,
+    memoryBullets,
+    imageDataUrl,
+    originalImageUrl
+  );
 
-if (mem) {
-  // Skip if it’s basically already in memory context
-  if (isNearDuplicate(mem.content, memoryBullets)) {
-    console.log("[Router] Skipping duplicate memory:", mem.content);
-  } else {
-    await create_memory(mem);
+  if (mem) {
+    // Skip if it’s basically already in memory context
+    if (isNearDuplicate(mem.content, memoryBullets)) {
+      console.log("[Router] Skipping duplicate memory:", mem.content);
+    } else {
+      try {
+        await create_memory(mem);
+      } catch (e) {
+        console.warn("[Router] create_memory failed (continuing):", String(e?.message ?? e));
+      }
+    }
   }
+} catch (e) {
+  console.warn("[Router] decideWrite failed (continuing):", String(e?.message ?? e));
 }
 
     // Update convo after processing is complete
-    conversation.push({ role: "user", content: safeTextForMemoryOps(userText, hasImage) + (imageUrl ? `\n[imageUrl] ${imageUrl}` : hasImage ? "\n[image attached]" : "") });
+    conversation.push({ role: "user", content: safeTextForMemoryOps(userText, hasImage) + (imageUrl ? `\n[imageUrl] ${originalImageUrl}` : hasImage ? "\n[image attached]" : "") });
     conversation.push({ role: "assistant", content: shineReply });
 
     return res.json({ ok: true, text: shineReply, mode, memories_used: memoryBullets.length });
