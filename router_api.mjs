@@ -239,8 +239,8 @@ const toolsList = await mcp.listTools();
 const toolNames = new Set((toolsList?.tools ?? []).map((t) => t.name));
 console.log("MCP tools:", [...toolNames].sort().join(", "));
 
-// Extract memory bullets from MCP tool response (common pattern: JSON with results[].data.content)
-function extractMemoryBullets(toolResponse) {
+// Extract memory entries from MCP tool response (content + tags/type/etc.)
+function extractMemoryEntries(toolResponse) {
   const outerText = toolResponse?.content?.find((c) => c.type === "text")?.text;
   if (!outerText) return [];
 
@@ -260,29 +260,46 @@ function extractMemoryBullets(toolResponse) {
   }
 
   const results = Array.isArray(parsed?.results) ? parsed.results : [];
-  const bullets = [];
+  const entries = [];
 
   for (const r of results) {
-    const c = r?.data?.content;
-    if (typeof c === "string" && c.trim()) bullets.push(c.trim());
+    const d = r?.data || {};
+    const content = typeof d.content === "string" ? d.content.trim() : "";
+    if (!content) continue;
+
+    const tags = Array.isArray(d.tags)
+      ? d.tags.map((t) => String(t).trim()).filter(Boolean)
+      : [];
+
+    const memory_type = typeof d.memory_type === "string" ? d.memory_type.trim() : "";
+    const importance_level = typeof d.importance_level === "number" ? d.importance_level : null;
+    const similarity_score = typeof r.similarity_score === "number" ? r.similarity_score : null;
+
+    entries.push({
+      content,
+      tags,
+      memory_type,
+      importance_level,
+      similarity_score,
+      memory_id: d.memory_id ? String(d.memory_id) : null,
+    });
   }
 
-  if (!bullets.length) {
+  if (!entries.length) {
     const keys = parsed && typeof parsed === "object" ? Object.keys(parsed).slice(0, 10) : [];
-    console.log("[Router] extractMemoryBullets: no bullets; parsed keys:", keys);
+    console.log("[Router] extractMemoryEntries: no entries; parsed keys:", keys);
   }
 
-  // Fallback: plain text
-  if (!bullets.length && typeof outerText === "string") {
+  // Fallback: plain text lines
+  if (!entries.length && typeof outerText === "string") {
     const _lines = outerText.split(String.fromCharCode(10));
- 
     for (const line of _lines) {
       const t = line.split(String.fromCharCode(13)).join("").trim();
-      if (t) bullets.push(t);
+      if (t) entries.push({ content: t, tags: [], memory_type: "", importance_level: null, similarity_score: null, memory_id: null });
     }
   }
 
-  return bullets;
+  return entries;
 }
 
 async function search_memories(query, limit = 5) {
@@ -294,7 +311,7 @@ async function search_memories(query, limit = 5) {
   });
   const _rawText = r?.content?.find((c) => c.type === "text")?.text;
   if (_rawText) console.log("[MCP] search_memories raw response text:", _rawText.slice(0, 800));
-  return extractMemoryBullets(r);
+  return extractMemoryEntries(r);
 }
 
 async function create_memory(mem) {
@@ -316,6 +333,32 @@ function sanitizeMemoryQuery(q) {
     .replace(/\bor\b/gi, " ")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function entryMatchesTagIntent(userText, entry) {
+  const t = String(userText || "").toLowerCase();
+  const entryTags = (entry?.tags || []).map((x) => String(x).toLowerCase());
+
+  const intents = [
+    { keywords: ["artist", "who drew", "who made", "art by", "credit", "creator"], tags: ["artist", "art", "creator", "credit"] },
+    { keywords: ["username", "handle", "user name", "who are you", "who am i"], tags: ["username", "handle", "name"] },
+    { keywords: ["favorite color", "fav color", "preferred color", "colour"], tags: ["color", "colour", "aesthetic"] },
+  ];
+
+  for (const intent of intents) {
+    if (!intent.keywords.some((k) => t.includes(k))) continue;
+    if (intent.tags.some((tag) => entryTags.includes(tag))) return true;
+  }
+  return false;
+}
+
+function formatMemoryEntryForModel(e) {
+  const tagStr = e.tags?.length ? `tags: ${e.tags.join(", ")}` : "";
+  const meta = [];
+  if (e.memory_type) meta.push(`type: ${e.memory_type}`);
+  if (typeof e.importance_level === "number") meta.push(`importance: ${e.importance_level}`);
+  if (tagStr) meta.push(tagStr);
+  return meta.length ? `${e.content} (${meta.join("; ")})` : e.content;
 }
 
 // --------------------
@@ -394,9 +437,9 @@ ${memoryBullets.map(b => "- " + b).join(NL)}`;
 // --------------------
 // Model B: Shine answer (no tools)
 // --------------------
-async function modelB_answer(userText, memoryBullets, conversation, mode, imageDataUrl, originalImageUrl) {
-  const memoryContext = memoryBullets.length
-    ? memoryBullets.slice(0, 8).map((b) => `- ${b}`).join(NL)
+async function modelB_answer(userText, memoryEntries, conversation, mode, imageDataUrl, originalImageUrl) {
+    const memoryContext = (memoryEntries && memoryEntries.length)
+    ? memoryEntries.slice(0, 10).map(formatMemoryEntryForModel).map((s) => `- ${s}`).join(NL)
     : "";
 
   const sys1 = { role: "system", content: buildShineSystemPrompt(mode) };
@@ -428,10 +471,32 @@ async function modelA_decideWrite(userText, shineReply, memoryBullets, imageData
       "Store stable relationship preferences if clearly stated.",
       "Avoid one-off events unless user explicitly asked to remember/save.",
       "Avoid duplicates based on existing memories.",
-      "",
+		"ONLY store a memory if it is:",
+"- a stable preference (likes/dislikes),",
+"- a stable profile fact (name, identity, recurring traits),",
+"- a stable project/plan the user is working on,",
+"- a boundary/safety rule,",
+"- or something the user explicitly asked you to remember/save.",
+"",
+"DO NOT store:",
+"- details inferred from an image (colors, objects, setting) unless the user explicitly says it is important to remember,",
+"- one-off observations, vibes, guesses, or scene descriptions (e.g., room color, weather, birdsong),",
+"- anything about Shine's 'world' unless Shine explicitly stated it as a stable personal fact earlier,",
+"- conversational filler like jokes, greetings, or 'we had fun',",
+"- duplicates or paraphrases of existing memories.",
+"",
+"For IMAGE MESSAGES:",
+"- default to NO_WRITE unless the user explicitly says 'remember this' or provides a stable preference/profile fact.",
+"",
+"Return NO_WRITE unless the memory would still matter in a week.",
       "Output MUST be either:",
       "NO_WRITE",
-      "or a single JSON object:",
+      "or JSON (no markdown/code fences):",
+      "- a single JSON object",
+      "or",
+      "- a JSON array of objects (0-3 items max)",
+      "",
+      "Each object schema:",
       '{ "content": "...", "memory_type":"preference|profile|project|boundary|relationship|note", "importance_level":1-5, "tags":["..."] }',
       "Avoid duplicates based on existing memories.",
 "IMPORTANT: If the new memory is only a paraphrase, confirmation, expansion, or rewording of an existing memory, output NO_WRITE.",
@@ -461,17 +526,42 @@ const ctxText =
 
   const txt = (r.choices?.[0]?.message?.content ?? "").trim();
   console.log("[ModelA] decideWrite raw:", txt);
-  if (!txt || /^NO_WRITE$/i.test(txt)) return null;
 
-  const parsed = safeJsonParse(txt);
-  if (!parsed?.content) return null;
+  if (!txt || /^NO_WRITE$/i.test(txt)) return [];
 
-  return {
-    content: String(parsed.content).trim(),
-    memory_type: typeof parsed.memory_type === "string" ? parsed.memory_type : "note",
-    importance_level: typeof parsed.importance_level === "number" ? parsed.importance_level : 3,
-    tags: Array.isArray(parsed.tags) ? parsed.tags.map(String) : [],
-  };
+  // Try: parse JSON directly (handles proper array/object)
+  let parsed = safeJsonParse(txt);
+
+  // If direct parse failed, attempt to extract multiple JSON objects from the text
+  if (!parsed) {
+    const objects = [];
+    const reObj = /\{[\s\S]*?\}/g;
+    let m;
+    while ((m = reObj.exec(txt)) !== null) {
+      const o = safeJsonParse(m[0]);
+      if (o && typeof o === "object") objects.push(o);
+    }
+    parsed = objects.length ? objects : null;
+  }
+
+  // Normalize to an array of memory objects
+  const arr = Array.isArray(parsed)
+    ? parsed
+    : (parsed && typeof parsed === "object" ? [parsed] : []);
+
+  if (!arr.length) return [];
+
+  function normalizeMemory(obj) {
+    if (!obj?.content) return null;
+    return {
+      content: String(obj.content).trim(),
+      memory_type: typeof obj.memory_type === "string" ? obj.memory_type : "note",
+      importance_level: typeof obj.importance_level === "number" ? obj.importance_level : 3,
+      tags: Array.isArray(obj.tags) ? obj.tags.map(String) : [],
+    };
+  }
+
+  return arr.map(normalizeMemory).filter(Boolean);
 }
 
 // --------------------
@@ -506,12 +596,12 @@ app.post("/generate", async (req, res) => {
     const conversation = getConversation(conversationId);
 
 // Phase 1: ALWAYS search memory before answering
-let memoryBullets = [];
+let memoryEntries = [];
 
 // 1) Always do a baseline memory search first
 try {
   const defaultQ = buildDefaultMemoryQuery(safeTextForMemoryOps(userText, hasImage), conversation);
-  memoryBullets = await search_memories(defaultQ, 8);
+  memoryEntries = await search_memories(defaultQ, 8);
 } catch (e) {
   console.warn("[Router] baseline memory search failed:", String(e?.message ?? e));
 }
@@ -520,47 +610,69 @@ try {
 try {
   const s = await modelA_decideSearch(userText, imageDataUrl, originalImageUrl);
   if (s.shouldSearch && s.query) {
-    const refined = await search_memories(sanitizeMemoryQuery(s.query) || safeTextForMemoryOps(userText, hasImage), 12);
-    const seen = new Set(memoryBullets);
-    for (const b of refined) if (!seen.has(b)) memoryBullets.push(b);
+    const refined = await search_memories(
+      sanitizeMemoryQuery(s.query) || safeTextForMemoryOps(userText, hasImage),
+      12
+    );
+    const seen = new Set(memoryEntries.map((e) => e.content));
+    for (const e of refined) if (!seen.has(e.content)) memoryEntries.push(e);
   }
 } catch (e) {
   console.warn("[Router] refined memory search failed:", String(e?.message ?? e));
 }
 
-// 3) Pattern B: filter for relevance (best-effort; keep unfiltered on failure)
+// 3) Deterministic tag pinning (never let Model A filter drop these)
+const pinned = memoryEntries.filter((e) => entryMatchesTagIntent(userText, e));
+
+// 4) Pattern B: filter for relevance (best-effort; keep unfiltered on failure)
 try {
-  const filtered = await modelA_filterMemory(userText, memoryBullets, imageDataUrl, originalImageUrl);
-  // Don’t let an over-strict filter erase useful retrieved memories
-  if (Array.isArray(filtered) && filtered.length) memoryBullets = filtered;
-  console.log("[Router] filtered memory bullets:", memoryBullets);
+  const memoryBullets = memoryEntries.map((e) => e.content);
+  const filteredBullets = await modelA_filterMemory(userText, memoryBullets, imageDataUrl, originalImageUrl);
+
+  if (Array.isArray(filteredBullets) && filteredBullets.length) {
+    const keep = new Set(filteredBullets);
+    memoryEntries = memoryEntries.filter((e) => keep.has(e.content));
+  }
+
+  // Merge pinned back in
+  const seen = new Set(memoryEntries.map((e) => e.content));
+  for (const e of pinned) if (!seen.has(e.content)) memoryEntries.push(e);
+
+  console.log(
+    "[Router] filtered memory entries:",
+    memoryEntries.map((e) => ({ content: e.content, tags: e.tags }))
+  );
 } catch (e) {
   console.warn("[Router] memory filter failed (using unfiltered):", String(e?.message ?? e));
 }
 
 // Phase 2: Shine answers
-    const shineReply = await modelB_answer(userText, memoryBullets, conversation, mode, imageDataUrl, originalImageUrl);
+    const shineReply = await modelB_answer(userText, memoryEntries, conversation, mode, imageDataUrl, originalImageUrl);
 
-// Phase 3: decide write -> MCP create_memory (NON-FATAL)
+// Phase 3: decide write -> MCP create_memory (NON-FATAL, supports multiple)
 try {
-  const mem = await modelA_decideWrite(
+  const mems = await modelA_decideWrite(
     userText,
     shineReply,
-    memoryBullets,
+    memoryEntries.map((e) => e.content),
     imageDataUrl,
     originalImageUrl
   );
 
-  if (mem) {
+  for (const mem of mems) {
+    if (!mem?.content) continue;
+
     // Skip if it’s basically already in memory context
-    if (isNearDuplicate(mem.content, memoryBullets)) {
+    if (isNearDuplicate(mem.content, memoryEntries.map((e) => e.content))) {
       console.log("[Router] Skipping duplicate memory:", mem.content);
-    } else {
-      try {
-        await create_memory(mem);
-      } catch (e) {
-        console.warn("[Router] create_memory failed (continuing):", String(e?.message ?? e));
-      }
+      continue;
+    }
+
+    try {
+      await create_memory(mem);
+      console.log("[Router] Memory created:", mem.content);
+    } catch (e) {
+      console.warn("[Router] create_memory failed (continuing):", String(e?.message ?? e));
     }
   }
 } catch (e) {
@@ -571,7 +683,7 @@ try {
     conversation.push({ role: "user", content: safeTextForMemoryOps(userText, hasImage) + (imageUrl ? `\n[imageUrl] ${originalImageUrl}` : hasImage ? "\n[image attached]" : "") });
     conversation.push({ role: "assistant", content: shineReply });
 
-    return res.json({ ok: true, text: shineReply, mode, memories_used: memoryBullets.length });
+    return res.json({ ok: true, text: shineReply, mode, memories_used: memoryEntries.length });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.stack ?? e) });
   }
