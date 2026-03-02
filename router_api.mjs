@@ -29,6 +29,9 @@ loadDotEnvIfPresent();
 
 
 
+const NL = String.fromCharCode(10);
+const CR = String.fromCharCode(13);
+
 // --------------------
 // CONFIG
 // --------------------
@@ -91,6 +94,31 @@ const EMOJI_RE =
   /[\u{1F300}-\u{1F5FF}\u{1F600}-\u{1F64F}\u{1F680}-\u{1F6FF}\u{1F700}-\u{1F77F}\u{1F780}-\u{1F7FF}\u{1F800}-\u{1F8FF}\u{1F900}-\u{1F9FF}\u{1FA00}-\u{1FAFF}\u{2600}-\u{27BF}]/gu;
 const stripEmojis = (s) => String(s ?? "").replace(EMOJI_RE, "").trim();
 
+function pickImageInput(reqBody) {
+  if (reqBody?.imageUrl && typeof reqBody.imageUrl === "string") return { imageUrl: reqBody.imageUrl, image: null };
+  if (reqBody?.image && typeof reqBody.image === "string") return { imageUrl: null, image: reqBody.image };
+  const atts = Array.isArray(reqBody?.attachments) ? reqBody.attachments : [];
+  const firstUrl = atts.find(a => typeof a?.url === "string")?.url;
+  if (firstUrl) return { imageUrl: firstUrl, image: null };
+  return { imageUrl: null, image: null };
+}
+
+function buildUserContent(text, image, imageUrl) {
+  const t = String(text ?? "").trim();
+  if (!image && !imageUrl) return t;
+  const url = imageUrl || image;
+  return [
+    { type: "text", text: t || "Describe this image." },
+    { type: "image_url", image_url: { url } },
+  ];
+}
+
+function safeTextForMemoryOps(text, hasImage) {
+  const t = String(text ?? "").trim();
+  return hasImage ? (t ? `${t} [image attached]` : "[image attached]") : t;
+}
+
+
 function buildDefaultMemoryQuery(userText, conversation) {
   const lastUserTurns = [...conversation]
     .filter(m => m.role === "user")
@@ -140,10 +168,10 @@ function safeJsonParse(s) {
 const promptCfg = JSON.parse(fs.readFileSync(SHINE_PROMPT_PATH, "utf-8"));
 
 function buildShineSystemPrompt(mode = "default") {
-  const persona = (promptCfg.persona ?? []).join("\n");
-  const guardrails = (promptCfg.guardrails ?? []).join("\n");
-  const modeLines = (promptCfg.modes?.[mode] ?? promptCfg.modes?.default ?? []).join("\n");
-  return [persona, "", guardrails, "", "MODE:", modeLines].join("\n").trim();
+  const persona = (promptCfg.persona ?? []).join(NL);
+  const guardrails = (promptCfg.guardrails ?? []).join(NL);
+  const modeLines = (promptCfg.modes?.[mode] ?? promptCfg.modes?.default ?? []).join(NL);
+  return [persona, "", guardrails, "", "MODE:", modeLines].join(NL).trim();
 }
 
 // --------------------
@@ -267,7 +295,7 @@ function sanitizeMemoryQuery(q) {
 // --------------------
 // Model A: decide search (pre)
 // --------------------
-async function modelA_decideSearch(userText) {
+async function modelA_decideSearch(userText, image, imageUrl) {
   const sys = {
     role: "system",
     content: [
@@ -284,16 +312,16 @@ async function modelA_decideSearch(userText) {
       "SEARCH: <short query>",
       "or",
       "NO_SEARCH",
-    ].join("\n"),
+    ].join(NL),
   };
 
   const r = await openai.chat.completions.create({
     model: MODEL_A,
-    messages: [sys, { role: "user", content: userText }],
+    messages: [sys, { role: "user", content: buildUserContent(userText, image, imageUrl) }],
     temperature: 0.2,
   });
 
-  const line = (r.choices?.[0]?.message?.content ?? "").split("\n").find(Boolean)?.trim() ?? "";
+  const line = (r.choices?.[0]?.message?.content ?? "").split(NL).find(Boolean)?.trim() ?? "";
   if (/^SEARCH:/i.test(line)) {
     const q = line.split(String.fromCharCode(13)).join("").trim();
     return { shouldSearch: true, query: q || userText };
@@ -304,7 +332,7 @@ async function modelA_decideSearch(userText) {
 // --------------------
 // Model A: filter memory bullets for relevance (pre)
 // --------------------
-async function modelA_filterMemory(userText, memoryBullets) {
+async function modelA_filterMemory(userText, memoryBullets, image, imageUrl) {
   if (!memoryBullets.length) return [];
 
   const sys = {
@@ -315,15 +343,16 @@ async function modelA_filterMemory(userText, memoryBullets) {
       "If none are relevant, return [].",
       "Do not modify the bullet text.",
       "Do NOT wrap the JSON in markdown or code fences."
-    ].join("\n"),
+    ].join(NL),
   };
 
-  const mem = {
-    role: "user",
-    content:
-      `USER MESSAGE:\n${userText}\n\n` +
-      `MEMORY BULLETS:\n${memoryBullets.map(b => "- " + b).join("\n")}`,
-  };
+  const bulletsText = `USER MESSAGE:
+${userText}
+
+MEMORY BULLETS:
+${memoryBullets.map(b => "- " + b).join(NL)}`;
+
+  const mem = { role: "user", content: buildUserContent(bulletsText, image, imageUrl) };
 
   const r = await openai.chat.completions.create({
     model: MODEL_A,
@@ -339,9 +368,9 @@ async function modelA_filterMemory(userText, memoryBullets) {
 // --------------------
 // Model B: Shine answer (no tools)
 // --------------------
-async function modelB_answer(userText, memoryBullets, conversation, mode) {
+async function modelB_answer(userText, memoryBullets, conversation, mode, image, imageUrl) {
   const memoryContext = memoryBullets.length
-    ? memoryBullets.slice(0, 8).map((b) => `- ${b}`).join("\n")
+    ? memoryBullets.slice(0, 8).map((b) => `- ${b}`).join(NL)
     : "";
 
   const sys1 = { role: "system", content: buildShineSystemPrompt(mode) };
@@ -352,7 +381,7 @@ async function modelB_answer(userText, memoryBullets, conversation, mode) {
 
   const r = await openai.chat.completions.create({
     model: MODEL_B,
-    messages: [sys1, sys2, ...conversation, { role: "user", content: userText }],
+    messages: [sys1, sys2, ...conversation, { role: "user", content: buildUserContent(userText, image, imageUrl) }],
     temperature: 0.7,
   });
 
@@ -362,7 +391,7 @@ async function modelB_answer(userText, memoryBullets, conversation, mode) {
 // --------------------
 // Model A: decide write (post) after seeing Shine reply
 // --------------------
-async function modelA_decideWrite(userText, shineReply, memoryBullets) {
+async function modelA_decideWrite(userText, shineReply, memoryBullets, image, imageUrl) {
   const sys = {
     role: "system",
     content: [
@@ -383,18 +412,24 @@ async function modelA_decideWrite(userText, shineReply, memoryBullets) {
 "Only write if it adds genuinely new stable information (new preference, new boundary, new project detail).",
 "Do NOT write meta-memories like 'confirmed/expanded from previous mentions'. Store the stable fact itself, not commentary.",
       "Keep content short and unambiguous.",
-    ].join("\n"),
+    ].join(NL),
   };
 
   const mem = {
     role: "system",
-    content: ["EXISTING RELEVANT MEMORIES:", ...memoryBullets.map((b) => `- ${b}`)].join("\n"),
+    content: ["EXISTING RELEVANT MEMORIES:", ...memoryBullets.map((b) => `- ${b}`)].join(NL),
   };
 
-  const ctx = {
-    role: "user",
-    content: `USER SAID:\n${userText}\n\nSHINE REPLIED:\n${shineReply}`,
-  };
+  const ctxText = `USER SAID:
+${safeTextForMemoryOps(userText, !!(image || imageUrl))}
+
+SHINE REPLIED:
+${shineReply}` + (imageUrl ? `
+
+IMAGE URL:
+${imageUrl}` : "");
+
+  const ctx = { role: "user", content: buildUserContent(ctxText, image, imageUrl) };
 
   const r = await openai.chat.completions.create({
     model: MODEL_A,
@@ -430,7 +465,7 @@ function getConversation(id) {
 // HTTP API
 // --------------------
 const app = express();
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || "25mb" }));
 
 app.post("/generate", async (req, res) => {
   try {
@@ -438,7 +473,10 @@ app.post("/generate", async (req, res) => {
     const mode = String(req.body.mode ?? "default");
     const userText = stripEmojis(String(req.body.text ?? ""));
 
-    if (!userText.trim()) return res.status(400).json({ ok: false, error: "Missing text" });
+    const { imageUrl, image } = pickImageInput(req.body);
+    const hasImage = !!(imageUrl || image);
+
+    if (!userText.trim() && !hasImage) return res.status(400).json({ ok: false, error: "Missing text (or provide image/imageUrl)" });
 
     const conversation = getConversation(conversationId);
 
@@ -447,7 +485,7 @@ let memoryBullets = [];
 
 // 1) Always do a baseline memory search first
 try {
-  const defaultQ = buildDefaultMemoryQuery(userText, conversation);
+  const defaultQ = buildDefaultMemoryQuery(safeTextForMemoryOps(userText, hasImage), conversation);
   memoryBullets = await search_memories(defaultQ, 8);
 } catch (e) {
   console.warn("[Router] baseline memory search failed:", String(e?.message ?? e));
@@ -455,9 +493,9 @@ try {
 
 // 2) Optional refinement pass (best-effort; never cancels baseline results)
 try {
-  const s = await modelA_decideSearch(userText);
+  const s = await modelA_decideSearch(userText, image, imageUrl);
   if (s.shouldSearch && s.query) {
-    const refined = await search_memories(sanitizeMemoryQuery(s.query) || userText, 12);
+    const refined = await search_memories(sanitizeMemoryQuery(s.query) || safeTextForMemoryOps(userText, hasImage), 12);
     const seen = new Set(memoryBullets);
     for (const b of refined) if (!seen.has(b)) memoryBullets.push(b);
   }
@@ -467,7 +505,7 @@ try {
 
 // 3) Pattern B: filter for relevance (best-effort; keep unfiltered on failure)
 try {
-  const filtered = await modelA_filterMemory(userText, memoryBullets);
+  const filtered = await modelA_filterMemory(userText, memoryBullets, image, imageUrl);
   // Don’t let an over-strict filter erase useful retrieved memories
   if (Array.isArray(filtered) && filtered.length) memoryBullets = filtered;
   console.log("[Router] filtered memory bullets:", memoryBullets);
@@ -476,10 +514,10 @@ try {
 }
 
 // Phase 2: Shine answers
-    const shineReply = await modelB_answer(userText, memoryBullets, conversation, mode);
+    const shineReply = await modelB_answer(userText, memoryBullets, conversation, mode, image, imageUrl);
 
     // Phase 3: decide write -> MCP create_memory
-const mem = await modelA_decideWrite(userText, shineReply, memoryBullets);
+const mem = await modelA_decideWrite(userText, shineReply, memoryBullets, image, imageUrl);
 
 if (mem) {
   // Skip if it’s basically already in memory context
@@ -491,7 +529,7 @@ if (mem) {
 }
 
     // Update convo after processing is complete
-    conversation.push({ role: "user", content: userText });
+    conversation.push({ role: "user", content: safeTextForMemoryOps(userText, hasImage) + (imageUrl ? `\n[imageUrl] ${imageUrl}` : hasImage ? "\n[image attached]" : "") });
     conversation.push({ role: "assistant", content: shineReply });
 
     return res.json({ ok: true, text: shineReply, mode, memories_used: memoryBullets.length });
